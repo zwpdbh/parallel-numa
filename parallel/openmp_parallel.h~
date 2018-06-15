@@ -1,0 +1,8 @@
+#ifndef openmp_parallel_h
+#define openmp_parallel_h
+
+#include "mylib.h"
+
+void openmp_numa(GlobalVar* g);
+
+#endif

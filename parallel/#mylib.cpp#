@@ -1,0 +1,337 @@
+#include "mylib.h"
+#include <math.h>
+
+using namespace std;
+
+void check_aligned(long address, int align_size, const char* s) {
+  printf("check alignment for %s\n", s);
+  if (address % align_size) {
+    printf("address is not aligned \n");
+  } else {
+    printf("address is %ld, is aligned with %d\n", address, align_size);
+  }
+}
+
+GlobalVar::GlobalVar(long rows, long cols, int n_threads, int n_nodes, int option) 
+  : rows(rows), cols(cols), n_threads(n_threads), n_nodes(n_nodes), option(option)
+{
+
+  this->time_records = (long*)emalloc(sizeof(long) * n_threads);
+  for (int i = 0; i < n_threads; i++) {
+    time_records[i] = 0;
+  }
+
+  pthread_barrier_init(&b, NULL, n_threads);
+    
+  if(option == 0 || option == 1 || option == 2 || option == 3) {
+    this->mx = (float**)emalloc(sizeof(float*) * this->rows);
+
+    this->v = (float*) emalloc(sizeof(float) * this->cols);
+    for (int i = 0; i < this->cols; i++) {
+      this->v[i] = 1;
+    }
+    this->w = (float*) emalloc(sizeof(float) * this->rows);
+    for (int i = 0; i < this->rows; i++) {
+      this->w[i] = 0;
+    }
+
+  } else if (option == 4)  {
+
+    this->unAlignedMx = (float**)emalloc(sizeof(float*) * this->rows + 128);
+    this->mx = (float**)(((uintptr_t)this->unAlignedMx & ~0x7F) + 0x80);
+    //this->mx = (float**)emalloc(sizeof(float*) * this->rows); 
+
+    /**align v*/
+    this->unAlignedV = (float*) emalloc(sizeof(float) * this->cols + 128);
+    this->v = (float*)(((uintptr_t)this->unAlignedV & ~0x7F) + 0x80);
+    for (int i = 0; i < this->cols; i++) {
+      this->v[i] = 1;
+    }
+
+    /**align w*/
+    this->unAlignedW = (float*)emalloc(sizeof(float) *  this->rows + 128);
+    this->w = (float*)(((uintptr_t)this->unAlignedW & ~0x7F) + 0x80);
+    for (long i = 0; i < this->rows; i++) {
+      this->w[i] = 0;
+    }
+
+  }
+
+  int thread_id = 0;
+  vector<int> index_set = {0, 32, 2, 34, 3, 35, 1, 33};
+  for (int node = 0; node < index_set.size(); node++) {
+    vector<int> cpus_on_node;
+    for (int cpu = index_set[node]; cpu < index_set[node] + 32; cpu += 4) {
+      this->cpu_to_node.insert(make_pair(cpu, node));
+
+      this->thread_to_cpu.insert(make_pair(thread_id, cpu));
+      thread_id += 1;
+
+      cpus_on_node.push_back(cpu);
+    }
+    this->node_to_cpus.insert(make_pair(node, cpus_on_node));
+  }
+  
+}
+
+GlobalVar::~GlobalVar() {
+  printf("Destructor has been called\n");
+
+  if (this->option == 4) {
+    for(long i = 0; i < this->rows; i++) {
+      numa_free(this->mx[i], sizeof(float) * this->cols);
+    }
+    free(this->unAlignedMx);
+    free(this->unAlignedV);
+    free(this->unAlignedW);
+    free(this->time_records);
+  } else if (this->option == 1 || this->option == 2) {
+    for (long i = 0; i < this->rows; i++) {
+      numa_free(this->mx[i], sizeof(float) * this->cols);
+    }
+    free(this->mx);
+    free(this->w);
+    free(this->v);
+    free(this->time_records);
+  } else if (this->option == 0 || this->option == 3) {
+    for (long i = 0; i < this->rows; i++) {
+      free(this->mx[i]);
+    }
+    free(this->mx);
+    free(this->w);
+    free(this->v);
+    free(this->time_records);
+  }
+}
+
+
+void *emalloc(size_t s) {
+  void *result = malloc(s);
+  if (result == nullptr) {
+    fprintf(stderr, "memory allocation failed");
+    exit(EXIT_FAILURE);
+  }
+  return result;
+}
+
+void *remalloc(void *p, size_t s) {
+  void *result = realloc(p, s);
+  if (result == NULL) {
+    fprintf(stderr, "memory allocation failed");
+    exit(EXIT_FAILURE);
+  }
+  return result;
+}
+
+
+void fix_current_thread_to_cpu(int cpu_id) {
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  CPU_SET(cpu_id, &cpuset);
+  pthread_t tid = pthread_self();
+  pthread_setaffinity_np(tid, sizeof(cpu_set_t), &cpuset);
+}
+
+void migrate_to_node(int node_id, map<int, vector<int> > topology_inverse) {
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  vector<int> cpus = topology_inverse[node_id];
+  for (int i = 0; i < cpus.size(); i++) {
+    CPU_SET(cpus[i], &cpuset);
+  }
+  pthread_t tid = pthread_self();
+  pthread_setaffinity_np(tid, sizeof(cpu_set_t), &cpuset);
+}
+
+
+void construct_barrier(pInfo* pthreads, int n_threads) {
+  int err;
+  void* status;
+  int index = 0;
+  if (n_threads < 64) {
+    index = 1;
+  }
+
+  for (int i = index; i < 64; i++) {
+    err = pthread_join(pthreads[i].thread, &status);
+    if(err) {
+      printf("error, return code from pthread_join() is %d\n", *(int *)status);
+    }
+  }
+}
+
+
+void check_time_records(long* time_records, int n) {
+  int index = 0;
+  long max = 0;
+
+  for (int i = 0; i < n; i++) {
+    //    printf("thread_%d takes: %ld\n", i, time_records[i]);
+    if (time_records[i] > max) {
+      index = i;
+      max = time_records[i];
+    }
+  }
+  printf("thread_%d takes longest, use: %ld\n", index, max);
+}
+
+void check_address_if_on_node(void* address, int node_index, long i, long j) {
+  void* ptr_to_check = address;
+  
+  int status[1];
+  int ret_code;
+  status[0] = -1;
+  ret_code = move_pages(0, 1, &ptr_to_check, NULL, status, 0);
+
+  if (status[0] != node_index) {
+    printf("mx[%ld][%ld] should be allocated on node_%d, but it is allocated on node_%d\n", i, j, node_index, status[0]);
+  }
+}
+
+void* alloc_fn(void* arg) {
+  pInfo info = *(pInfo *)arg;
+  
+  /**If I don't include this, the variance between threads is big*/
+  fix_current_thread_to_cpu(info.g->thread_to_cpu[info.thread_id]);
+
+  int current_cpu = sched_getcpu();
+  if (current_cpu != info.g->thread_to_cpu[info.thread_id]) {
+    printf("during allocation, CPU is not fixed!\n");
+  }
+
+  pthread_barrier_wait(&info.g->b);
+  int node_index = info.thread_id / (info.g->n_threads / info.g->n_nodes);
+
+  for (long k = info.from; k < info.from + info.job_size; k++) {
+    info.g->mx[k] = (float*)numa_alloc_onnode(sizeof(float) * info.g->cols, node_index);
+    /**
+    for (long j = 0; j < info.g->cols; j++) {
+      info.g->mx[k][j] = 0;
+    }
+    */
+
+  }
+}
+
+void* alloc_no_numa_fn(void *arg) {
+  pInfo info = *(pInfo *)arg;
+  pthread_barrier_wait(&info.g->b);
+
+  for (long k = info.from; k < info.from + info.job_size; k++) {
+    info.g->mx[k] = (float*)emalloc(sizeof(float) * info.g->cols);
+    for (long j = 0; j < info.g->cols; j++) {
+      info.g->mx[k][j] = 0;
+    }
+  }
+}
+
+
+void* access_fn(void* arg) {
+  pInfo info = *(pInfo *)arg;
+  fix_current_thread_to_cpu(info.g->thread_to_cpu[info.thread_id]);
+  pthread_barrier_wait(&info.g->b);
+  do_access(&info);
+  pthread_barrier_wait(&info.g->b);
+}
+
+
+void* access_no_numa_fn(void* arg) {
+  pInfo info = *(pInfo *)arg;
+  pthread_barrier_wait(&info.g->b);
+  do_access(&info);
+  pthread_barrier_wait(&info.g->b);
+}
+
+void do_access(pInfo* p) {
+  int current_cpu = sched_getcpu();
+  auto start = tick();
+  for (long k = p->from; k < p->from + p->job_size; k++) {
+    for (long j = 0; j < p->g->cols; j++) {
+      p->g->mx[k][j] = 3;
+    }
+  }
+  auto end = tick();
+  p->g->time_records[p->thread_id] = end - start;
+  if (current_cpu != sched_getcpu() || current_cpu != p->g->thread_to_cpu[p->thread_id]) {
+    printf("during access, CPU is not fixed!\n");
+  }
+}
+
+
+void* multiply_fn(void* arg) {
+  pInfo info = *(pInfo*)arg;
+  fix_current_thread_to_cpu(info.g->thread_to_cpu[info.thread_id]);
+  pthread_barrier_wait(&info.g->b);
+  do_multiplication(&info);
+  pthread_barrier_wait(&info.g->b);
+}
+
+void* multiply_no_numa_fn(void* arg) {
+  pInfo info = *(pInfo*)arg;
+  pthread_barrier_wait(&info.g->b);
+  do_multiplication(&info);
+  pthread_barrier_wait(&info.g->b);
+}
+
+
+void do_multiplication(pInfo* p) {
+  int current_cpu = sched_getcpu();
+  auto start = tick();
+
+  for (long k = p->from; k < (p->from + p->job_size); k++) {
+    for (long j = 0; j < p->g->cols; j++) {
+      p->g->w[k] += (p->g->mx[k][j] * p->g->v[j]);
+    }
+  }
+
+  auto end = tick();
+  p->g->time_records[p->thread_id] = end - start;
+  if (current_cpu != sched_getcpu() || current_cpu != p->g->thread_to_cpu[p->thread_id]) {
+    printf("during multiplication, cpu is not fixed!\n");
+  }
+}
+
+
+
+void check_mx(GlobalVar* g) {
+  printf("\n===mx:===\n");
+  for(long i = 0; i < g->rows; i++) {
+    for (long j = 0; j < g->cols; j++) {
+      printf("%.f ", g->mx[i][j]);
+    }
+    printf("\n");
+  }
+}
+
+void check_w(GlobalVar* g) {
+  printf("\n===w:===\n");
+  for (long i = 0; i < g->rows; i++) {
+    printf("%.f ", g->w[i]);
+  }
+  printf("\n");
+}
+
+void check_v(GlobalVar* g) {
+  printf("===v:===\n");
+  for (long i = 0; i < g->cols; i++) {
+    printf("%.f ", g->v[i]);
+  }
+  printf("\n");
+}
+
+
+void* my_numa_alloc(aligned_ptr p, size_t s, size_t align_size, int node_index) {
+  void* ptr = numa_alloc_onnode(s + align_size, node_index);
+  if (ptr == NULL) {
+    printf("my_numa_alloc error, exit...\n");
+    exit(-1);
+  }
+  p->actual_allocated_ptr = ptr;
+
+  void* newptr = (long)ptr & (~0x3F) + (0x40);
+  p->actual_used_ptr = newptr;
+  
+  return p;
+}
+
+
